@@ -1,0 +1,207 @@
+# ----- Install (run once in Colab) -----
+#step 1
+!pip install earthengine-api geemap geopy
+!pip install torch torchvision pillow matplotlib transformers huggingface_hub
+!pip install segmentation-models-pytorch --quiet
+
+#step 2
+# ----- Imports -----
+import ee
+import geemap
+from geopy.geocoders import Nominatim
+import numpy as np
+from PIL import Image
+import torch
+import matplotlib.pyplot as plt
+from transformers import AutoImageProcessor, AutoModelForSemanticSegmentation
+from huggingface_hub import hf_hub_download
+import math
+import io
+from transformers import SegformerForSemanticSegmentation, SegformerFeatureExtractor
+
+#step 3
+# ----- Authentication (Colab) -----
+# Interactive: will open a link to authorize
+ee.Authenticate()       # follow the URL prompt
+ee.Initialize(project='deepnexus-478407')
+
+#step 4
+# ----- Helper: geocode place -> bbox -----
+def bbox_from_place(place_name, padding_km=2.0):
+    geolocator = Nominatim(user_agent="gee_seg_app")
+    loc = geolocator.geocode(place_name)
+    if loc is None:
+        raise ValueError(f"Could not geocode '{place_name}'")
+    lat, lon = loc.latitude, loc.longitude
+    # small square around point (approx): convert km -> degrees (approx)
+    deg_per_km = 1/111.32
+    pad_deg = padding_km * deg_per_km
+    minx, miny = lon - pad_deg, lat - pad_deg
+    maxx, maxy = lon + pad_deg, lat + pad_deg
+    return (minx, miny, maxx, maxy), (lat, lon)
+
+#step 5
+# ----- Helper: make a year composite from Sentinel-2 -----
+def maskS2(image):
+    # Use SCL: 4 = cloud shadow, 5 = cloud, 6 = high cloud, 7 = cirrus
+    scl = image.select('SCL')
+    cloud_mask = scl.neq(4).And(scl.neq(5)).And(scl.neq(6)).And(scl.neq(7))
+    return image.updateMask(cloud_mask)
+
+'''def sentinel_year_composite(aoi_geom, year, bands=['B4','B3','B2'], scale=10):
+    start = f'{year}-01-01'
+    end   = f'{year}-12-31'
+
+    col = (
+        ee.ImageCollection('COPERNICUS/S2_SR')
+        .filterDate(start, end)
+        .filterBounds(aoi_geom)
+        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60))
+        .map(maskS2)   # <-- NEW MASK
+    )
+
+    comp = col.median().select(bands)
+    comp_8bit = comp.divide(3000).multiply(255).uint8()
+    return comp_8bit
+'''
+def sentinel_year_composite(aoi_geom, year):
+    start = f'{year}-01-01'
+    end   = f'{year}-12-31'
+
+    col = (
+        ee.ImageCollection('COPERNICUS/S2_SR')
+        .filterDate(start, end)
+        .filterBounds(aoi_geom)
+        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60))
+        .map(maskS2)                                  # mask clouds
+        .map(lambda img: img.select(['B4','B3','B2']))  # <<< IMPORTANT FIX
+    )
+
+    comp = col.median()                               # now safe — all images have same 3 bands
+
+    comp_8bit = comp.divide(3000).multiply(255).uint8()
+    return comp_8bit
+
+#step 6
+# ----- Helper: get numpy image for an ee.Image clipped to AOI and resized -----
+def ee_image_to_numpy(img, aoi_geom, width=512, height=512):
+    # Extract polygon coordinates as client-side list
+    coords = aoi_geom.coordinates().getInfo()  # <-- THIS fixes ALL geometry errors
+
+    region_json = {
+        "type": "Polygon",
+        "coordinates": coords  # coords is already a list of rings
+    }
+
+    # Generate thumbnail URL
+    url = img.getThumbURL({
+        'region': region_json,
+        'format': 'png',
+        'dimensions': f'{width}x{height}'
+    })
+
+    import requests
+    from io import BytesIO
+    response = requests.get(url)
+
+    # safety check
+    if response.status_code != 200:
+        raise Exception("Could not fetch from backend: " + response.text)
+
+    pil_img = Image.open(BytesIO(response.content)).convert("RGB")
+    return np.array(pil_img)
+
+
+#step 7
+# ----- Load your SegFormer model (same as your code) -----
+model_name = "nvidia/segformer-b0-finetuned-ade-512-512"
+processor = AutoImageProcessor.from_pretrained(model_name)
+model = AutoModelForSemanticSegmentation.from_pretrained(model_name)
+model.eval()
+
+#step 8
+# ----- Main pipeline: take place name + years, produce masks & change map -----
+def process_place(place_name, year1, year2, tile_size=512):
+    bbox, center = bbox_from_place(place_name, padding_km=25.0)
+
+    minx, miny, maxx, maxy = bbox
+    aoi = ee.Geometry.Rectangle([minx, miny, maxx, maxy], geodesic=False)
+
+    print("AOI bbox:", bbox, "center:", center)
+
+    # get composites
+    img1 = sentinel_year_composite(aoi, year1)
+    img2 = sentinel_year_composite(aoi, year2)
+
+    # Resize or tile depending on bbox size; for demo, we'll resize entire bbox to tile_size
+    np_img1 = ee_image_to_numpy(img1, aoi, width=tile_size, height=tile_size)
+    np_img2 = ee_image_to_numpy(img2, aoi, width=tile_size, height=tile_size)
+  
+
+    # Convert to PIL Images
+    pil1 = Image.fromarray(np_img1.astype(np.uint8))
+    pil2 = Image.fromarray(np_img2.astype(np.uint8))
+
+    # Run processor+model exactly like in your original snippet
+    inputs1 = processor(images=pil1, return_tensors="pt")
+    inputs2 = processor(images=pil2, return_tensors="pt")
+    with torch.no_grad():
+        out1 = model(**inputs1)
+        out2 = model(**inputs2)
+    mask1 = torch.nn.functional.interpolate(out1.logits, size=pil1.size[::-1], mode="bilinear", align_corners=False).argmax(dim=1)[0].cpu().numpy()
+    mask2 = torch.nn.functional.interpolate(out2.logits, size=pil2.size[::-1], mode="bilinear", align_corners=False).argmax(dim=1)[0].cpu().numpy()
+
+    # change map and class transitions
+    change_map = (mask1 != mask2).astype(np.uint8)
+    id2label = model.config.id2label
+    # count transitions
+    from collections import Counter
+    transitions = Counter()
+    flat1 = mask1.flatten()
+    flat2 = mask2.flatten()
+    for a,b in zip(flat1, flat2):
+        if a!=b:
+            transitions[f"{id2label.get(int(a),'?')} → {id2label.get(int(b),'?')}"] += 1
+
+    return pil1, pil2, mask1, mask2, change_map, transitions
+
+#step 9--example
+# ----- Run for example -----
+#place = "Bangalore, India"
+#p1, p2, m1, m2, cm, trans = process_place("Bangalore, India", 2020, 2021)
+
+# Step 9 — user input for any place on Earth
+place = input("Enter a place name (example: Bangalore, India): ").strip()
+# Choose years. NOTE: if you plan to use ESA WorldCover, only 2020 and 2021 are available.
+year1 = int(input("Enter year 1 (e.g. 2020): ").strip())
+year2 = int(input("Enter year 2 (e.g. 2021): ").strip())
+
+p1, p2, m1, m2, cm, trans = process_place(place, year1, year2)
+#some places you can enter 
+#Bangalore, India
+#Dubai
+#London, UK
+#Sydney, Australia
+#Cape Town
+#Madrid, Spain
+#step 10
+# Step 10 — Visualize (uses variables from user input)
+# Step 10 — Visualize (uses variables from user input)
+plt.figure(figsize=(15,5))
+
+plt.subplot(1,3,1)
+plt.imshow(p1); plt.title(f"{place} {year1}"); plt.axis('off')
+
+plt.subplot(1,3,2)
+plt.imshow(p2); plt.title(f"{place} {year2}"); plt.axis('off')
+
+plt.subplot(1,3,3)
+plt.imshow(cm, cmap='Reds'); plt.title("Change Map (mask1 != mask2)"); plt.axis('off')
+
+plt.show()
+
+#step 11
+# ----- Print top transitions -----
+print("Top transitions:")
+for k,v in trans.most_common(10):
+    print(k, ":", v, "pixels")
